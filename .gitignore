@@ -11,7 +11,8 @@ venv/
 .venv/
 env/
 
-# Output
+# Data
+input/
 output/
 *.nii
 *.nii.gz
@@ -19,6 +20,7 @@ output/
 *.DCM
 *.ima
 *.IMA
+progress.csv
 
 # OS
 .DS_Store

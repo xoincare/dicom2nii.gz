@@ -1,4 +1,5 @@
 dcm2niix
 nibabel
 numpy
+pydicom
 TotalSegmentator
