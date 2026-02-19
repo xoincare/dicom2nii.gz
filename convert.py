@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-DICOM → VerSe-compatible NIfTI 변환 파이프라인
+DICOM → NIfTI 변환 파이프라인
 
-PACS에서 가져온 DICOM을 3d-spine 파이프라인 호환 NIfTI로 변환합니다.
+PACS에서 가져온 DICOM을 NIfTI(.nii.gz)로 변환합니다.
 DICOM 헤더(PatientID + StudyDate)를 읽어 환자·날짜별로 자동 분리합니다.
 progress.csv에 변환 진행 상황과 DICOM 정보를 기록합니다.
 
@@ -12,7 +12,6 @@ progress.csv에 변환 진행 상황과 DICOM 정보를 기록합니다.
 사용법:
     python convert.py                                    # ./input → ./output
     python convert.py --input-dir /dicoms --output-dir /out
-    python convert.py --ct-only                          # 분할 없이 CT만 변환
 
 입력 구조 (PACS 폴더 — 깊이 무관, 재귀 탐색):
     input/
@@ -20,11 +19,10 @@ progress.csv에 변환 진행 상황과 DICOM 정보를 기록합니다.
     ├── 2026-02-19/00449886/CT/*.dcm
     └── ...  (어떤 깊이든 .dcm 파일만 있으면 자동 감지)
 
-출력 구조 (VerSe-style, 3d-spine 호환):
+출력 구조:
     output/
     ├── sub-00457744_20260209/
-    │   ├── sub-00457744_20260209_ct.nii.gz
-    │   └── sub-00457744_20260209_seg-vert_msk.nii.gz
+    │   └── sub-00457744_20260209_ct.nii.gz
     └── sub-00449886_20260219/
         └── ...
     progress.csv
@@ -40,7 +38,6 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pydicom
 
 logging.basicConfig(
@@ -49,20 +46,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# TotalSegmentator 척추 라벨 → VerSe 라벨 매핑
-TOTALSEG_TO_VERSE = {
-    "vertebrae_T1": 8, "vertebrae_T2": 9, "vertebrae_T3": 10,
-    "vertebrae_T4": 11, "vertebrae_T5": 12, "vertebrae_T6": 13,
-    "vertebrae_T7": 14, "vertebrae_T8": 15, "vertebrae_T9": 16,
-    "vertebrae_T10": 17, "vertebrae_T11": 18, "vertebrae_T12": 19,
-    "vertebrae_L1": 20, "vertebrae_L2": 21, "vertebrae_L3": 22,
-    "vertebrae_L4": 23, "vertebrae_L5": 24,
-}
-
 PROGRESS_FIELDS = [
     "case_id", "patient_name", "patient_age", "patient_sex",
     "study_date", "modality", "num_slices", "dicom_source",
-    "status", "ct_file", "mask_file", "timestamp",
+    "status", "ct_file", "timestamp",
 ]
 
 
@@ -331,87 +318,18 @@ def convert_dicom_to_nifti(dicom_dir: Path, case_dir: Path, case_id: str) -> Pat
         return dst
 
 
-def run_totalsegmentator(ct_path: Path, case_dir: Path, case_id: str, fast: bool = False) -> Path | None:
-    """TotalSegmentator로 척추 분할 마스크 생성."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        seg_dir = Path(tmpdir) / "seg"
-
-        cmd = [
-            "TotalSegmentator",
-            "-i", str(ct_path),
-            "-o", str(seg_dir),
-            "--task", "vertebrae_body",
-        ]
-        if fast:
-            cmd.append("--fast")
-
-        logger.info("  Running TotalSegmentator (this may take a few minutes)...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            logger.warning("  vertebrae_body task failed, trying default task...")
-            cmd = [
-                "TotalSegmentator",
-                "-i", str(ct_path),
-                "-o", str(seg_dir),
-            ]
-            if fast:
-                cmd.append("--fast")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            if result.returncode != 0:
-                logger.error(f"  TotalSegmentator failed: {result.stderr[:500]}")
-                return None
-
-        return merge_vertebra_masks(seg_dir, ct_path, case_dir, case_id)
-
-
-def merge_vertebra_masks(seg_dir: Path, ct_path: Path, case_dir: Path, case_id: str) -> Path | None:
-    """TotalSegmentator 개별 척추 마스크를 VerSe 라벨 규칙으로 합칩니다."""
-    import nibabel as nib
-
-    ref_img = nib.load(ct_path)
-    combined_mask = np.zeros(ref_img.shape, dtype=np.uint8)
-    found_count = 0
-
-    for ts_name, verse_label in TOTALSEG_TO_VERSE.items():
-        mask_path = seg_dir / f"{ts_name}.nii.gz"
-        if not mask_path.exists():
-            continue
-
-        mask_data = nib.load(mask_path).get_fdata()
-        combined_mask[mask_data > 0.5] = verse_label
-        found_count += 1
-
-    if found_count == 0:
-        logger.error(f"  No vertebra masks found in {seg_dir}")
-        return None
-
-    logger.info(f"  Found {found_count}/17 vertebrae (T1-L5)")
-
-    mask_img = nib.Nifti1Image(combined_mask, ref_img.affine, ref_img.header)
-    mask_path = case_dir / f"{case_id}_seg-vert_msk.nii.gz"
-    nib.save(mask_img, mask_path)
-
-    return mask_path
-
-
 # ============================================================
 # Main
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DICOM → VerSe-compatible NIfTI 변환 (CT + 척추 분할 마스크)",
+        description="DICOM → NIfTI(.nii.gz) 변환",
     )
     parser.add_argument("--input-dir", type=str, default="input",
                         help="DICOM 폴더 경로 (default: input)")
     parser.add_argument("--output-dir", type=str, default="output",
                         help="출력 디렉토리 (default: output)")
-    parser.add_argument("--ct-only", action="store_true",
-                        help="CT 변환만 수행 (TotalSegmentator 분할 건너뛰기)")
-    parser.add_argument("--fast", action="store_true",
-                        help="TotalSegmentator fast 모드 (품질↓ 속도↑)")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -425,10 +343,6 @@ def main():
 
     if shutil.which("dcm2niix") is None:
         logger.error("dcm2niix not found. Install: conda install -c conda-forge dcm2niix")
-        sys.exit(1)
-
-    if not args.ct_only and shutil.which("TotalSegmentator") is None:
-        logger.error("TotalSegmentator not found. Install: pip install TotalSegmentator")
         sys.exit(1)
 
     # 기존 진행 상황 로드
@@ -447,8 +361,6 @@ def main():
     todo = [(p, cid, info) for p, cid, info in dicom_series if cid not in done_cases]
 
     logger.info(f"Found {len(dicom_series)} total, {len(done_cases)} done, {len(todo)} to process")
-    if args.ct_only:
-        logger.info("Mode: CT only (no segmentation)")
 
     if not todo:
         logger.info("Nothing new to process. Done!")
@@ -467,8 +379,8 @@ def main():
         case_dir = output_dir / case_id
         case_dir.mkdir(parents=True, exist_ok=True)
 
-        # Step 1: DICOM → NIfTI
-        logger.info("  Step 1: DICOM → NIfTI")
+        # DICOM → NIfTI
+        logger.info("  DICOM → NIfTI")
         ct_path = convert_dicom_to_nifti(dicom_path, case_dir, case_id)
         if ct_path is None:
             fail += 1
@@ -483,36 +395,10 @@ def main():
                 "dicom_source": str(dicom_path),
                 "status": "failed_ct",
                 "ct_file": "",
-                "mask_file": "",
                 "timestamp": datetime.now().isoformat(),
             })
             continue
         logger.info(f"  → {ct_path.name}")
-
-        mask_file = ""
-        if not args.ct_only:
-            # Step 2: 척추 분할
-            logger.info("  Step 2: Vertebra segmentation")
-            mask_path = run_totalsegmentator(ct_path, case_dir, case_id, fast=args.fast)
-            if mask_path is None:
-                fail += 1
-                append_progress(progress_path, {
-                    "case_id": case_id,
-                    "patient_name": info["patient_name"],
-                    "patient_age": info["patient_age"],
-                    "patient_sex": info["patient_sex"],
-                    "study_date": info["study_date"],
-                    "modality": info["modality"],
-                    "num_slices": info["num_slices"],
-                    "dicom_source": str(dicom_path),
-                    "status": "failed_seg",
-                    "ct_file": str(ct_path) if ct_path else "",
-                    "mask_file": "",
-                    "timestamp": datetime.now().isoformat(),
-                })
-                continue
-            logger.info(f"  → {mask_path.name}")
-            mask_file = str(mask_path)
 
         # 성공 → progress.csv에 즉시 기록
         success += 1
@@ -527,17 +413,12 @@ def main():
             "dicom_source": str(dicom_path),
             "status": "done",
             "ct_file": str(ct_path),
-            "mask_file": mask_file,
             "timestamp": datetime.now().isoformat(),
         })
 
     logger.info(f"\nDone! {success} success, {fail} failed out of {len(todo)}")
     logger.info(f"Progress: {progress_path}")
     logger.info(f"Output: {output_dir}")
-
-    if not args.ct_only:
-        logger.info("\n3d-spine 파이프라인에서 사용:")
-        logger.info(f"  python phase1_ssm/scripts/preprocess_meshes.py --ct-dir {output_dir}")
 
 
 if __name__ == "__main__":
