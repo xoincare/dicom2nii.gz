@@ -208,18 +208,109 @@ def append_progress(progress_path: Path, row: dict):
 # 변환 함수
 # ============================================================
 
+def _classify_orientation(desc: str) -> str:
+    """SeriesDescription에서 영상 방향을 분류합니다.
+
+    Returns: "SAG", "COR", "AX", or "OTHER"
+    """
+    d = desc.upper()
+    if any(k in d for k in ("SAG", "SAGITTAL")):
+        return "SAG"
+    if any(k in d for k in ("COR", "CORONAL")):
+        return "COR"
+    if any(k in d for k in ("AX", "AXIAL")):
+        return "AX"
+    return "OTHER"
+
+
+def _select_best_series(dicom_dir: Path) -> tuple[list[Path], str]:
+    """DICOM 디렉토리에서 SeriesInstanceUID별로 그룹화 후 최적 시리즈를 선택합니다.
+
+    선택 우선순위: SAG > COR > OTHER > AX (curved axial 사용 불가)
+    같은 우선순위 내에서는 슬라이스 수가 많은 시리즈를 선택합니다.
+
+    Returns:
+        (선택된 DICOM 파일 리스트, 시리즈 설명)
+    """
+    dcm_files: list[Path] = []
+    for pattern in ("*.dcm", "*.DCM", "*.ima", "*.IMA"):
+        dcm_files.extend(dicom_dir.glob(pattern))
+    if not dcm_files:
+        dcm_files = [f for f in dicom_dir.iterdir() if f.is_file() and not f.suffix]
+
+    # SeriesInstanceUID별로 그룹화
+    series_map: dict[str, list[Path]] = {}
+    series_desc: dict[str, str] = {}
+
+    for f in dcm_files:
+        try:
+            ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+            uid = str(getattr(ds, "SeriesInstanceUID", "unknown"))
+            desc = str(getattr(ds, "SeriesDescription", ""))
+            if uid not in series_map:
+                series_map[uid] = []
+                series_desc[uid] = desc
+            series_map[uid].append(f)
+        except Exception:
+            continue
+
+    if not series_map:
+        return dcm_files, "unknown"
+
+    # 모든 시리즈 정보 로깅
+    descriptions = [f"{series_desc[uid]}({len(files)})" for uid, files in series_map.items()]
+    logger.info(f"  Found {len(series_map)} series: {', '.join(descriptions)}")
+
+    if len(series_map) == 1:
+        uid = next(iter(series_map))
+        return series_map[uid], series_desc[uid]
+
+    # 우선순위: SAG > COR > OTHER > AX
+    orientation_priority = {"SAG": 0, "COR": 1, "OTHER": 2, "AX": 3}
+
+    def _series_sort_key(uid: str) -> tuple[int, int]:
+        orient = _classify_orientation(series_desc[uid])
+        priority = orientation_priority[orient]
+        # 같은 우선순위 내에서 슬라이스 수 많은 것 우선 (음수로 정렬)
+        return (priority, -len(series_map[uid]))
+
+    best_uid = min(series_map, key=_series_sort_key)
+    orient = _classify_orientation(series_desc[best_uid])
+    logger.info(f"  Selected: {series_desc[best_uid]} [{orient}] ({len(series_map[best_uid])} slices)")
+
+    if orient == "AX":
+        logger.warning("  ⚠ No SAG/COR series found, falling back to AX (may be curved axial)")
+
+    return series_map[best_uid], series_desc[best_uid]
+
+
 def convert_dicom_to_nifti(dicom_dir: Path, case_dir: Path, case_id: str) -> Path | None:
-    """dcm2niix로 DICOM → NIfTI 변환."""
+    """dcm2niix로 DICOM → NIfTI 변환.
+
+    여러 시리즈가 섞여 있으면 최적 시리즈만 필터링하여 변환합니다.
+    """
+    selected_files, series_desc = _select_best_series(dicom_dir)
+    if not selected_files:
+        logger.error(f"  No DICOM files found in {dicom_dir}")
+        return None
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+        tmp_out = Path(tmpdir) / "out"
+        tmp_out.mkdir()
+
+        # 선택된 시리즈만 임시 디렉토리에 복사
+        tmp_in = Path(tmpdir) / "in"
+        tmp_in.mkdir()
+        for f in selected_files:
+            shutil.copy2(f, tmp_in / f.name)
 
         cmd = [
             "dcm2niix",
             "-z", "y",
             "-f", case_id,
-            "-o", str(tmp),
+            "-o", str(tmp_out),
             "-b", "n",
-            str(dicom_dir),
+            str(tmp_in),
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -228,7 +319,7 @@ def convert_dicom_to_nifti(dicom_dir: Path, case_dir: Path, case_id: str) -> Pat
             logger.error(f"  dcm2niix failed for {case_id}: {result.stderr}")
             return None
 
-        nii_files = list(tmp.glob("*.nii.gz")) + list(tmp.glob("*.nii"))
+        nii_files = list(tmp_out.glob("*.nii.gz")) + list(tmp_out.glob("*.nii"))
         if not nii_files:
             logger.error(f"  No NIfTI output for {case_id}")
             return None
@@ -415,13 +506,13 @@ def main():
                     "num_slices": info["num_slices"],
                     "dicom_source": str(dicom_path),
                     "status": "failed_seg",
-                    "ct_file": str(ct_path.relative_to(Path.cwd())) if ct_path else "",
+                    "ct_file": str(ct_path) if ct_path else "",
                     "mask_file": "",
                     "timestamp": datetime.now().isoformat(),
                 })
                 continue
             logger.info(f"  → {mask_path.name}")
-            mask_file = str(mask_path.relative_to(Path.cwd()))
+            mask_file = str(mask_path)
 
         # 성공 → progress.csv에 즉시 기록
         success += 1
@@ -435,7 +526,7 @@ def main():
             "num_slices": info["num_slices"],
             "dicom_source": str(dicom_path),
             "status": "done",
-            "ct_file": str(ct_path.relative_to(Path.cwd())),
+            "ct_file": str(ct_path),
             "mask_file": mask_file,
             "timestamp": datetime.now().isoformat(),
         })
